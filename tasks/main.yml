@@ -150,7 +150,7 @@
 - name: Create self-signed certificate
   command: >
     openssl req -new -nodes -x509 -subj "{{ pagure_self_signed_cert_subj }}" -days 3650 -keyout {{ pagure_ssl_certificate_key }} -out {{ pagure_ssl_certificate }} -extensions v3_ca
-  creates={{ pagure_ssl_certificate }}  
+  creates={{ pagure_ssl_certificate }}
   when: pagure_create_self_signed_cert
   tags:
     - pagure
