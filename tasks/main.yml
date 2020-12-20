@@ -1,2 +1,376 @@
 ---
-# tasks
+- name: Install required packages
+  package: name={{ item }} state=present
+  with_items:
+    - pagure
+    - pagure-ci
+    - pagure-ev
+    - pagure-loadjson
+    - pagure-logcom
+    - pagure-milters
+    - pagure-webhook
+    - pagure-theme-pagureio
+    - python3-psycopg2
+    - python3-pygments
+    - redis
+    - python3-libsemanage
+    - mod_ssl
+    - python-mod_wsgi
+    - stunnel
+    # Use haveged to ensure the server keeps entropy
+    - haveged
+  tags:
+    - pagure
+    - packages
+
+- name: Initialize postgres if necessary
+  command: /usr/bin/postgresql-setup initdb
+           creates=/var/lib/pgsql/data
+  notify:
+    - restart postgresql
+  tags:
+    - pagure
+
+- name: Create the pagure DB user
+  become_user: postgres
+  become: true
+  postgres_user:
+    name: "{{ pagure_db_user }}"
+    password: "{{ pagure_db_pass }}"
+  tags:
+    - pagure
+    - postgresql
+
+- name: Create the pagure DB admin user
+  become_user: postgres
+  become: true
+  postgresql_user:
+    name: "{{ pagure_db_admin_user }}"
+    password: "{{ pagure_db_admin_password }}"
+  tags:
+    - pagure
+    - postgresql
+
+- name: Create the pagure database
+  become_user: postgres
+  become: true
+  postgresql_db:
+    name: "{{ pagure_db_name }}"
+    owner: "{{ pagure_db_user }}"
+    encode: UTF-8
+  tags:
+    - pagure
+    - postgresql
+
+- name: Put in robots.txt
+  template: src=robots.txt.j2 dest=/var/www/html/robots.txt
+  tags:
+    - pagure
+
+- name: Create the "git" user
+  command: useradd --create-home --home-dir=/srv/git/ git
+           creates=/srv/git/
+  tags:
+    - pagure
+
+- name: create the /attachments folder
+  file: state=directory
+        path=/srv/attachment
+        owner=git group=git mode=0775
+  tags:
+    - pagure
+
+- name: create the /var/log/pagure folder to store the logs
+  file: state=directory
+              path=/var/log/pagure
+              owner=git group=git mode=0755
+  tags:
+    - pagure
+
+- name: Adjust the ownership of /srv/git
+  file: name=/srv/git state=directory recurse=yes owner=git group=git
+  tage:
+    - gitolite
+
+- name: Creates all the directories where we store git repos
+  file: state=directory
+              path={{ item }}
+              owner=git group=git mode=0775
+  with_items:
+    - /srv/git/repositories/
+    - /srv/git/repositories/forks
+    - /srv/git/repositories/docs
+    - /srv/git/repositories/tickets
+    - /srv/git/repositories/requess
+    - /srv/git/remotes/
+  tags:
+    - pagure
+
+- name: Crate the /srv/tmp folder where to clone repos
+  file: state=directory
+              path=/srv/tmp
+              owenr=git group=git mode=0775
+  tags:
+    - pagure
+
+# Setup things for the mirroring feature
+
+- name: Create the paguremirroring group
+  group:
+    name: paguremirroring
+    state: present
+  tags:
+    - pagure
+    - mirror
+
+- name: Create the paguremirroring user
+  user:
+    name: paguremirroring
+    group: paguremirroring
+    groups: paguremirroring,git
+    shell: /bin/nologin
+    home: /srv/mirror
+  tags:
+    - pagure
+    - mirror
+
+# SSL certs
+
+- name: Create the directory for SSL certs
+  file:
+    path: /etc/pki/tls/certs
+    state: directory
+    owner: root
+    group: root
+    mode: 0700
+  tags:
+    - pagure
+    - ssl
+
+- name: Create self-signed certificate
+  command: >
+    openssl req -new -nodes -x509 -subj "{{ pagure_self_signed_cert_subj }}" -days 3650 -keyout {{ pagure_ssl_certificate_key }} -out {{ pagure_ssl_certificate }} -extensions v3_ca
+  creates={{ pagure_ssl_certificate }}  
+  when: pagure_create_self_signed_cert
+  tags:
+    - pagure
+    - ssl
+
+# TODO: Create a task to ensure the Self signed certificate
+
+# Postfix and Milter for Postfix
+
+- name: Add the /etc/aliases file
+  copy: src=aliases dest=/etc/aliases owner=root mode=644
+  tags:
+    - config
+    - pagure
+    - postfix
+  notify:
+    - restart postfix
+    - restart pagure_milter
+
+- name: install pagure_ev service definition
+  copy: src=pagure_ev.service
+        dest=/usr/lib/systemd/system/pagure_ev.service
+        owner=root group=root mode=0644
+  notify:
+    - reload systemd
+    - restart pagure_ev
+  tags:
+    - pagure
+    - pagure_ev
+
+# Setup stunnel for the event source server
+
+- name: Install stunnel service definition
+  copy: src=stunnel.service
+        dest=/usr/lib/systemd/system/stunnel.service
+        owner=root group=root mode=0644
+  notify:
+    - reload systemd
+    - restart stunnel
+  tags:
+    - pagure
+    - stunnel
+    - config
+
+- name: ensure old stunnel init file is gone
+  file: dest=/etc/init.d/stunnel/stunnel.init state=absent
+  tags:
+    - pagure
+    - stunnel
+    - config
+
+- name: Make a bundle file of the cert for stunnel
+  shell: cat {{ pagure_ssl_certificate }} > /etc/pki/certs/{{ pagure_domain }}.bundle.crt creates=/etc/pki/tls/certs/{{ pagure_domain }}.bundle.crt
+  tags:
+    - pagure
+    - stunnel
+    - config
+
+- name: Install stunnel.conf
+  template: src={{ item.file }}
+            dest={{ item.dest }}
+            owner=root group=root mode=0600
+  with_items:
+    - { file: stunnel-conf.j2, dest: /etc/stunnel/stunnel.conf }
+  notify: restart stunnel
+  tags:
+    - pagure
+    - stunnel
+    - config
+
+- name: Add the different service files for different services
+  copy: src={{ item }}.service
+        dest=/etc/systemd/system/{{ item }}.service
+        owner=root group=root mode=0755
+  with_items:
+    - pagure_fast_worker
+    - pagure_medium_worker
+    - pagure_slow_worker
+    - pagure_mirror
+  notify:
+    - reload systemd
+  tags:
+    - pagure
+
+# Set-up Pagure
+
+- name: Create the folders used for releases and archives
+  file: state=directory
+        path={{ item }}
+        owner=git group=git mode=0775
+  with_items:
+    - /var/www/releases
+    - /var/www/archives
+  tags:
+    - pagure
+    - web
+
+- name: copy sundry pagure configuration
+  template: src={{ item.file }}
+            dest={{ item.location }}/{{ item.file }}
+            owner=git group=postfix mode=0640
+  with_items:
+    - { file: pagure.cfg, location: /etc/pagure }
+    - { file: alembic.ini, location: /etc/pagure }
+  tags:
+    - config
+    - web
+    - pagure
+  notify:
+    - restart apache
+
+- name: Create the database scheme
+  command: /usr/bin/python3 /usr/share/pagure/pagure_createdb.py
+  changed_when: "1 != 1"
+  environment:
+    PAGURE_CONFIG: /etc/pagure/pagure.cfg
+  tags:
+    - web
+    - pagure
+
+- name: Install the configuration file to activate https
+  template: src={{ item }} dest=/etc/httpd/conf.d/{{ item }}
+            owner=root group=root mode=0644
+  with_items:
+    - 0_pagure.conf
+    - securityheaders.conf
+  tags:
+    - files
+    - config
+    - pagure
+    - sslciphers
+  notify:
+    - restart apache
+
+- name: Install the wsgi file
+  template: src={{ item }}
+            dest=/var/www/{{ item }}
+            owner=git group=git mode=0644
+  with_items:
+    - pagure.wsgi
+    - docs_pagure.wsgi
+  tags:
+    - config
+    - web
+    - pagure
+  notify:
+    - restart apache
+
+- name: Let paguremirroring read the pagure config
+  command: /usr/bin/setfacl -m user:paguremirroring:rx /etc/pagure/pagure.cfg
+  tags:
+    - pagure
+    - mirror
+
+- name: Add default facl so apache can read git repos
+  acl: default=yes etype=user entity=apache permissions="rx"
+  register: acl_updates
+  tags:
+    - pagure
+
+- name: Manually fix current default ACLs since Ansible doesn't know recursive acls
+  when: acl_updates.changed
+  command: /usr/bin/setfacl -Rdm user:apache:rx /srv/git
+  tags:
+    - pagure
+
+- name: Manually fix current default ACLs since Ansible doesn't know recursive acls
+  when: acl_updates.changed
+  command: /usr/bin/setfacl -Rm user:apache:rx /srv/git
+  tags:
+    - pagure
+
+- import_tasks: selinux.yml
+  tags:
+    - selinux
+
+# Ensure all the services are up and running
+
+- name: Start and enable httpd, postfix, pagure_milter
+  service: name={{ item }} enabled=yes state=started
+  with_items:
+    - httpd
+    - postfix
+    - stunnel
+    - redis
+    - pagure_ev
+    - pagure_ci
+    - pagure_loadjson
+    - pagure_logcom
+    - pagure_milter
+    - pagure_webhook
+    - pagure_worker
+    - pagure_gitolite_worker
+    - pagure_fast_worker
+    - pagure_medium_worker
+    - pagure_slow_worker
+    - pagure_mirror_project_in
+    - pagure_mirror_project_in.timer
+    - haveged
+  ignore_errors: true
+  tags:
+    - pagure
+    - service
+    - postfix
+
+- name: Setup logrotate to our needs
+  copy: src="{{ files }}/httpd/httpd.logrotate" dest=/etc/logrotate.d/httpd
+  tags:
+    - config
+    - apache
+
+- name: Add SAR script for pagure
+  copy: src=pagure_sar.py dest=/usr/local/bin/pagure_sar.py owner=git mode=0700
+  tags:
+    - SAR
+    - GDPR
+    - pagure
+
+- name: override the default syslog logrotate file
+  copy: src=syslog-logrotate dest=/etc/logrotate.d/syslog
+  tags:
+    - pagure
+    - logrotate
